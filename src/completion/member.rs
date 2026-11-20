@@ -194,11 +194,11 @@ fn all_members(
     let mut items = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut visited: HashSet<String> = HashSet::new();
-    // (class, inherited, owner whose protected access applies)
-    let mut queue: Vec<(String, bool, String)> =
-        vec![(class_name.to_string(), false, class_name.to_string())];
+    // (class, inherited, owner whose protected access applies, via_mixin)
+    let mut queue: Vec<(String, bool, String, bool)> =
+        vec![(class_name.to_string(), false, class_name.to_string(), false)];
     let mut is_root = true;
-    while let Some((current, inherited, owner)) = queue.pop() {
+    while let Some((current, inherited, owner, via_mixin)) = queue.pop() {
         if !visited.insert(current.clone()) {
             continue;
         }
@@ -213,13 +213,14 @@ fn all_members(
                 &class_like,
                 inherited,
                 is_static,
+                via_mixin,
                 &wants_method,
                 scope,
                 &mut items,
                 &mut seen_names,
             );
             let own_traits = class_like.class_traits();
-            let mut next: Vec<(String, bool, String)> = class_like
+            let mut next: Vec<(String, bool, String, bool)> = class_like
                 .ancestor_fqcns()
                 .into_iter()
                 .map(|a| {
@@ -230,17 +231,43 @@ fn all_members(
                     } else {
                         a.to_string()
                     };
-                    (a.to_string(), inherited || !via_own_trait, a_owner)
+                    (a.to_string(), inherited || !via_own_trait, a_owner, via_mixin)
                 })
                 .collect();
-            if !is_static {
-                next.extend(
-                    class_like
-                        .mixins()
-                        .iter()
-                        .map(|m| (m.to_string(), true, m.to_string())),
-                );
+            let mut mixins: Vec<String> = class_like
+                .mixins()
+                .iter()
+                .map(|m| m.to_string())
+                .collect();
+            if crate::types::type_map::is_eloquent_model(&current)
+                || crate::types::type_map::is_eloquent_model(class_like.fqcn().trim_start_matches('\\'))
+            {
+                let builder_fqcn = "Illuminate\\Database\\Eloquent\\Builder";
+                if !mixins.iter().any(|m| m == builder_fqcn) {
+                    mixins.push(builder_fqcn.to_string());
+                }
             }
+            if let Some(query_method) = class_like.own_methods().get("query") {
+                if let Some(return_type) = query_method
+                    .return_type
+                    .as_deref()
+                    .or(query_method.inferred_return_type.as_deref())
+                {
+                    let type_str = return_type.to_string();
+                    if let Some(builder_class) =
+                        crate::types::type_map::extract_builder_class_from_return_type(&type_str)
+                    {
+                        if !mixins.iter().any(|m| m == &builder_class) {
+                            mixins.push(builder_class);
+                        }
+                    }
+                }
+            }
+            next.extend(
+                mixins
+                    .into_iter()
+                    .map(|m| (m.clone(), true, m, true)),
+            );
             // `queue` is a stack: push in reverse so traits are visited before the parent.
             queue.extend(next.into_iter().rev());
             continue;
@@ -290,8 +317,25 @@ fn all_members(
                 n == name && scope.hides(visibility, inherited)
             })
         };
+        let doc_method_names: HashSet<String> = members
+            .doc_methods
+            .iter()
+            .map(|method| method.name.clone())
+            .collect();
         for (name, meth_is_static, has_params) in members.methods {
-            if wants_method(&name, meth_is_static)
+            let is_doc = doc_method_names.contains(&name);
+            let is_allowed = if is_doc {
+                !name.eq_ignore_ascii_case("__construct")
+            } else if via_mixin {
+                if is_static {
+                    !name.eq_ignore_ascii_case("__construct")
+                } else {
+                    !meth_is_static && !name.eq_ignore_ascii_case("__construct")
+                }
+            } else {
+                wants_method(&name, meth_is_static)
+            };
+            if is_allowed
                 && !hidden(&members.restricted_methods, &name)
                 && seen_names.insert(name.clone())
             {
@@ -304,7 +348,18 @@ fn all_members(
             }
         }
         for (name, prop_is_static) in &members.properties {
-            if *prop_is_static == is_static && !hidden(&members.restricted_properties, name) {
+            let prop_allowed = if via_mixin {
+                if is_static {
+                    true
+                } else {
+                    !*prop_is_static
+                }
+            } else {
+                *prop_is_static == is_static
+            };
+            if prop_allowed
+                && !hidden(&members.restricted_properties, name)
+            {
                 let label = format!("${name}");
                 if seen_names.insert(label.clone()) {
                     let detail = if !is_static && members.readonly_properties.contains(name) {
@@ -337,18 +392,26 @@ fn all_members(
                     });
                 }
             }
-        } else {
-            for mixin in mixin_classes_of(d, short) {
-                let mixin = resolve_class_ref(d, short, &mixin);
-                queue.push((mixin.clone(), true, mixin));
+        }
+        let mut mixins = mixin_classes_of(d, short);
+        if crate::types::type_map::is_eloquent_model(&current)
+            || crate::types::type_map::is_eloquent_model_or_short(short, Some(d))
+        {
+            let builder_fqcn = "Illuminate\\Database\\Eloquent\\Builder".to_string();
+            if !mixins.contains(&builder_fqcn) {
+                mixins.push(builder_fqcn);
             }
+        }
+        for mixin in mixins {
+            let mixin = resolve_class_ref(d, short, &mixin);
+            queue.push((mixin.clone(), true, mixin, true));
         }
         for trait_name in members.trait_uses {
             let trait_name = resolve_class_ref(d, short, &trait_name);
-            queue.push((trait_name, inherited, owner.clone()));
+            queue.push((trait_name, inherited, owner.clone(), via_mixin));
         }
         if let Some(p) = parent {
-            queue.push((p.clone(), true, p));
+            queue.push((p.clone(), true, p, via_mixin));
         }
     }
     items
@@ -403,6 +466,7 @@ fn push_mir_members(
     class_like: &ClassLike,
     inherited: bool,
     is_static: bool,
+    via_mixin: bool,
     wants_method: &dyn Fn(&str, bool) -> bool,
     scope: Scope,
     items: &mut Vec<CompletionItem>,
@@ -411,7 +475,18 @@ fn push_mir_members(
     let hidden = |visibility: Visibility| scope.hides(visibility, inherited);
     let owner = class_like.fqcn().to_string();
     for method in class_like.own_methods().values() {
-        if wants_method(&method.name, method.is_static)
+        let is_allowed = if method.is_virtual {
+            !method.name.eq_ignore_ascii_case("__construct")
+        } else if via_mixin {
+            if is_static {
+                !method.name.eq_ignore_ascii_case("__construct")
+            } else {
+                !method.is_static && !method.name.eq_ignore_ascii_case("__construct")
+            }
+        } else {
+            wants_method(&method.name, method.is_static)
+        };
+        if is_allowed
             && !hidden(method.visibility)
             && seen_names.insert(method.name.to_string())
         {
@@ -429,7 +504,10 @@ fn push_mir_members(
         .into_iter()
         .flat_map(|p| p.values())
     {
-        if prop.is_static != is_static || hidden(prop.visibility) {
+        if (!via_mixin && prop.is_static != is_static)
+            || (via_mixin && !is_static && prop.is_static)
+            || hidden(prop.visibility)
+        {
             continue;
         }
         let label = format!("${}", prop.name);
@@ -615,10 +693,340 @@ pub(super) fn magic_method_completions() -> Vec<CompletionItem> {
         .collect()
 }
 
-pub(super) fn resolve_receiver_class(
+fn find_matching_open_parenthesis(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let target_close_index = bytes.len().checked_sub(1)?;
+    if bytes[target_close_index] != b')' {
+        return None;
+    }
+
+    let mut paren_stack: Vec<usize> = Vec::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut is_escaped = false;
+
+    for (index, &byte_character) in bytes.iter().enumerate() {
+        if is_escaped {
+            is_escaped = false;
+            continue;
+        }
+        if byte_character == b'\\' && (in_single_quote || in_double_quote) {
+            is_escaped = true;
+            continue;
+        }
+        if byte_character == b'\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            continue;
+        }
+        if byte_character == b'"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+        if in_single_quote || in_double_quote {
+            continue;
+        }
+
+        if byte_character == b'(' {
+            paren_stack.push(index);
+        } else if byte_character == b')' {
+            if let Some(open_index) = paren_stack.pop() {
+                if index == target_close_index {
+                    return Some(open_index);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_return_type_to_classes(
+    return_type_string: &str,
+    declaring_class: &str,
+    mixin_target: Option<&str>,
+    calling_class: &str,
+    primary_doc: &ParsedDoc,
+    find_class_doc: Option<super::ClassDocLookup<'_>>,
+) -> Option<Vec<String>> {
+    let trimmed_return_type = return_type_string.trim();
+    if trimmed_return_type.is_empty() {
+        return None;
+    }
+
+    let mut result_classes: Vec<String> = Vec::new();
+    let union_types = trimmed_return_type.split('|');
+
+    for union_element in union_types {
+        let mut cleaned_type = union_element.trim();
+        if cleaned_type.starts_with('?') {
+            cleaned_type = &cleaned_type[1..];
+        }
+        if let Some(generic_index) = cleaned_type.find('<') {
+            cleaned_type = &cleaned_type[..generic_index];
+        }
+        cleaned_type = cleaned_type.trim();
+
+        if cleaned_type.is_empty() {
+            continue;
+        }
+
+        let is_static_or_this = cleaned_type.eq_ignore_ascii_case("static")
+            || cleaned_type.eq_ignore_ascii_case("$this")
+            || cleaned_type.eq_ignore_ascii_case("self")
+            || (cleaned_type.starts_with("static(") && cleaned_type.ends_with(')'))
+            || (cleaned_type.starts_with("self(") && cleaned_type.ends_with(')'))
+            || (cleaned_type.starts_with("$this(") && cleaned_type.ends_with(')'));
+
+        if is_static_or_this {
+            if let Some(target) = mixin_target {
+                result_classes.push(target.to_string());
+            } else if !calling_class.is_empty() {
+                result_classes.push(calling_class.to_string());
+            } else if cleaned_type.starts_with("static(") && cleaned_type.ends_with(')') {
+                let inner = &cleaned_type[7..cleaned_type.len() - 1];
+                result_classes.push(inner.to_string());
+            } else {
+                result_classes.push(declaring_class.to_string());
+            }
+            continue;
+        }
+
+        let lower_type = cleaned_type.to_ascii_lowercase();
+        if matches!(
+            lower_type.as_str(),
+            "void"
+                | "never"
+                | "null"
+                | "int"
+                | "integer"
+                | "float"
+                | "double"
+                | "string"
+                | "bool"
+                | "boolean"
+                | "array"
+                | "iterable"
+                | "callable"
+                | "object"
+                | "mixed"
+                | "resource"
+                | "false"
+                | "true"
+        ) {
+            continue;
+        }
+
+        let declaring_doc = find_class_doc.and_then(|lookup| lookup(declaring_class));
+        let doc_to_resolve_with = declaring_doc.as_deref().unwrap_or(primary_doc);
+        let short_name = crate::text::fqn_short_name(declaring_class);
+        let resolved_class_name = if cleaned_type.starts_with('\\') || cleaned_type.contains('\\') {
+            cleaned_type.trim_start_matches('\\').to_string()
+        } else {
+            let file_imports = doc_to_resolve_with.file_imports();
+            if let Some(imported_fqcn) = file_imports.get(cleaned_type) {
+                imported_fqcn.trim_start_matches('\\').to_string()
+            } else {
+                crate::types::type_map::resolve_class_ref(
+                    doc_to_resolve_with,
+                    short_name,
+                    cleaned_type,
+                )
+            }
+        };
+
+        if !resolved_class_name.is_empty() && !result_classes.contains(&resolved_class_name) {
+            result_classes.push(resolved_class_name);
+        }
+    }
+
+    if result_classes.is_empty() {
+        None
+    } else {
+        Some(result_classes)
+    }
+}
+
+fn resolve_call_chain_receiver(
+    before_text: &str,
+    source: &str,
+    primary_doc: &ParsedDoc,
+    other_docs: &[Arc<ParsedDoc>],
+    position: Position,
+    find_class_doc: Option<super::ClassDocLookup<'_>>,
+    session: Option<&DocumentStore>,
+    analysis: Option<&mir_analyzer::FileAnalysis>,
+    recursion_depth: usize,
+) -> Option<Vec<String>> {
+    if recursion_depth > 10 {
+        return None;
+    }
+
+    let trimmed_before = before_text.trim_end();
+    if !trimmed_before.ends_with(')') {
+        return None;
+    }
+
+    let open_parenthesis_index = find_matching_open_parenthesis(trimmed_before)?;
+    let call_head = trimmed_before[..open_parenthesis_index].trim_end();
+
+    let method_name: String = call_head
+        .chars()
+        .rev()
+        .take_while(|&character| character.is_alphanumeric() || character == '_')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+
+    if method_name.is_empty() {
+        return None;
+    }
+
+    let receiver_part = call_head[..call_head.len() - method_name.len()].trim_end();
+
+    if let Some(static_prefix) = receiver_part.strip_suffix("::") {
+        let static_class_expression = static_prefix.trim_end();
+        let raw_class_name: String = static_class_expression
+            .chars()
+            .rev()
+            .take_while(|&character| {
+                character.is_alphanumeric() || character == '_' || character == '\\'
+            })
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+
+        if raw_class_name.is_empty() {
+            return None;
+        }
+
+        let target_class = if raw_class_name.eq_ignore_ascii_case("self")
+            || raw_class_name.eq_ignore_ascii_case("static")
+        {
+            crate::types::type_map::enclosing_class_at(source, primary_doc, position)?
+        } else if raw_class_name.eq_ignore_ascii_case("parent") {
+            let enclosing =
+                crate::types::type_map::enclosing_class_at(source, primary_doc, position)?;
+            crate::types::type_map::parent_class_name(primary_doc, &enclosing)?
+        } else if raw_class_name.starts_with('\\') || raw_class_name.contains('\\') {
+            raw_class_name.trim_start_matches('\\').to_string()
+        } else {
+            let file_imports = primary_doc.file_imports();
+            if let Some(imported_fqcn) = file_imports.get(&raw_class_name) {
+                imported_fqcn.trim_start_matches('\\').to_string()
+            } else {
+                let short_name = crate::text::fqn_short_name(&raw_class_name);
+                crate::types::type_map::resolve_class_ref(primary_doc, short_name, &raw_class_name)
+            }
+        };
+
+        let method_info = crate::types::type_map::find_method_in_class_hierarchy(
+            primary_doc,
+            other_docs,
+            find_class_doc,
+            session,
+            &target_class,
+            &method_name,
+        )?;
+
+        let return_type_string = method_info.return_type.as_deref()?;
+        resolve_return_type_to_classes(
+            return_type_string,
+            &method_info.declaring_class,
+            method_info.mixin_target.as_deref(),
+            &target_class,
+            primary_doc,
+            find_class_doc,
+        )
+    } else if let Some(instance_prefix) = receiver_part
+        .strip_suffix("->")
+        .or_else(|| receiver_part.strip_suffix("?->"))
+    {
+        let receiver_expression = instance_prefix.trim_end();
+        let receiver_classes = if receiver_expression.ends_with(')') {
+            resolve_call_chain_receiver(
+                receiver_expression,
+                source,
+                primary_doc,
+                other_docs,
+                position,
+                find_class_doc,
+                session,
+                analysis,
+                recursion_depth + 1,
+            )?
+        } else if let Some(new_class) = extract_new_class_before_arrow(receiver_expression) {
+            let resolved = if new_class.starts_with('\\') || new_class.contains('\\') {
+                new_class.trim_start_matches('\\').to_string()
+            } else {
+                let imports = primary_doc.file_imports();
+                if let Some(fqcn) = imports.get(&new_class) {
+                    fqcn.trim_start_matches('\\').to_string()
+                } else {
+                    new_class
+                }
+            };
+            vec![resolved]
+        } else {
+            let var_name: String = receiver_expression
+                .chars()
+                .rev()
+                .take_while(|&character| {
+                    character.is_alphanumeric() || character == '_' || character == '$'
+                })
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            if var_name == "$this" {
+                let enclosing =
+                    crate::types::type_map::enclosing_class_at(source, primary_doc, position)?;
+                vec![enclosing]
+            } else if !var_name.is_empty() {
+                let var_offset =
+                    line_byte_offset(primary_doc, position.line, receiver_expression.len());
+                analysis.and_then(|file_analysis| receiver_class_at(file_analysis, var_offset))?
+            } else {
+                return None;
+            }
+        };
+
+        for receiver_class in receiver_classes {
+            if let Some(method_info) = crate::types::type_map::find_method_in_class_hierarchy(
+                primary_doc,
+                other_docs,
+                find_class_doc,
+                session,
+                &receiver_class,
+                &method_name,
+            ) {
+                if let Some(return_type_string) = method_info.return_type.as_deref() {
+                    if let Some(resolved_classes) = resolve_return_type_to_classes(
+                        return_type_string,
+                        &method_info.declaring_class,
+                        method_info.mixin_target.as_deref(),
+                        &receiver_class,
+                        primary_doc,
+                        find_class_doc,
+                    ) {
+                        return Some(resolved_classes);
+                    }
+                }
+            }
+        }
+        None
+    } else {
+        None
+    }
+}
+
+pub(crate) fn resolve_receiver_class(
     source: &str,
     doc: &ParsedDoc,
+    other_docs: &[Arc<ParsedDoc>],
     position: Position,
+    find_class_doc: Option<super::ClassDocLookup<'_>>,
+    session: Option<&DocumentStore>,
     analysis: Option<&mir_analyzer::FileAnalysis>,
 ) -> Option<Vec<String>> {
     let line = source.lines().nth(position.line as usize)?;
@@ -665,7 +1073,20 @@ pub(super) fn resolve_receiver_class(
         // so the take_while extractor collects nothing.  Ask mir for the type of
         // the call-expression at that position; mir records the return type there.
         let chain_offset = line_byte_offset(doc, position.line, before.len());
-        return analysis.and_then(|a| receiver_class_at(a, chain_offset));
+        if let Some(classes) = analysis.and_then(|a| receiver_class_at(a, chain_offset)) {
+            return Some(classes);
+        }
+        return resolve_call_chain_receiver(
+            before,
+            source,
+            doc,
+            other_docs,
+            position,
+            find_class_doc,
+            session,
+            analysis,
+            0,
+        );
     }
     let var_name = if var_name.starts_with('$') {
         var_name

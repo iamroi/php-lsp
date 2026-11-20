@@ -14,9 +14,10 @@ mod match_arm;
 use match_arm::match_arm_completions;
 
 mod member;
+pub(crate) use member::resolve_receiver_class;
 use member::{
     all_instance_members, all_static_members, is_parent_receiver, magic_method_completions,
-    mir_method_params, resolve_receiver_class, resolve_static_receiver,
+    mir_method_params, resolve_static_receiver,
 };
 
 mod namespace;
@@ -169,7 +170,15 @@ fn resolve_call_params(
         character: receiver_col,
     };
     if before_receiver.ends_with("->") || before_receiver.ends_with("?->") {
-        return resolve_receiver_class(source, doc, receiver_pos, ctx.analysis)
+        return resolve_receiver_class(
+            source,
+            doc,
+            other_docs,
+            receiver_pos,
+            ctx.find_class_doc,
+            ctx.session,
+            ctx.analysis,
+        )
             .unwrap_or_default()
             .iter()
             .map(|class_name| {
@@ -486,7 +495,15 @@ pub fn filtered_completions_at(
         Some(">") => {
             // Arrow: $obj->  or  $this->
             if let (Some(src), Some(pos)) = (source, position)
-                && let Some(class_names) = resolve_receiver_class(src, doc, pos, ctx.analysis)
+                && let Some(class_names) = resolve_receiver_class(
+                    src,
+                    doc,
+                    other_docs,
+                    pos,
+                    ctx.find_class_doc,
+                    ctx.session,
+                    ctx.analysis,
+                )
             {
                 // Feature 5: support union types (Foo|Bar)
                 let mut items = Vec::new();
@@ -645,7 +662,15 @@ pub fn filtered_completions_at(
                         line: pos.line,
                         character: arrow_end_char,
                     };
-                    if let Some(cls) = resolve_receiver_class(src, doc, arrow_pos, ctx.analysis) {
+                    if let Some(cls) = resolve_receiver_class(
+                        src,
+                        doc,
+                        other_docs,
+                        arrow_pos,
+                        ctx.find_class_doc,
+                        ctx.session,
+                        ctx.analysis,
+                    ) {
                         let mut items = Vec::new();
                         let mut seen = std::collections::HashSet::new();
                         for class_name in &cls {

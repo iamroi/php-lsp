@@ -362,6 +362,7 @@ function f(User $u) { $u->$0 }
     expect![[r#"
         Property    $email
         Property    $id
+        Method      make
         Method      total"#]]
     .assert_eq(&members(&out));
 }
@@ -654,3 +655,285 @@ async fn unopened_vendor_attribute_gets_constructor_named_arguments() {
         Variable    path: | #Route argument"#]]
     .assert_eq(&render_completion_ordered(&resp));
 }
+
+#[tokio::test]
+async fn mixin_public_members_are_offered_on_static_call() {
+    let mut s = TestServer::new().await;
+    s.validate_syntax(false);
+    let out = s
+        .check_completion_ordered(
+            r#"<?php
+class Builder {
+    public function where(): static { return $this; }
+    public function get(): array { return []; }
+    public static function query(): void {}
+}
+/** @mixin Builder */
+class Model { public function save(): void {} }
+Model::$0
+"#,
+        )
+        .await;
+    expect![[r#"
+        Method      get
+        Method      query
+        Method      where"#]]
+    .assert_eq(&members(&out));
+}
+
+#[tokio::test]
+async fn mixin_inherited_from_parent_class_on_static_call() {
+    let mut s = TestServer::new().await;
+    s.validate_syntax(false);
+    let out = s
+        .check_completion_ordered(
+            r#"<?php
+class Builder {
+    public function where(): static { return $this; }
+    public function first(): static { return $this; }
+    public function get(): array { return []; }
+}
+/** @mixin Builder */
+class Model {}
+class User extends Model {}
+User::$0
+"#,
+        )
+        .await;
+    expect![[r#"
+        Method      first
+        Method      get
+        Method      where"#]]
+    .assert_eq(&members(&out));
+}
+
+#[tokio::test]
+async fn chained_call_after_static_call_resolves_mixin_return_type() {
+    let mut s = TestServer::new().await;
+    s.validate_syntax(false);
+    let out = s
+        .check_completion_ordered(
+            r#"<?php
+class Builder {
+    public function where(string $col, mixed $val): static { return $this; }
+    public function first(): ?static { return $this; }
+    public function get(): array { return []; }
+    public function orderBy(string $column): static { return $this; }
+}
+/** @mixin Builder */
+class Model {}
+class User extends Model {}
+User::where('id', 1)->$0
+"#,
+        )
+        .await;
+    expect![[r#"
+        Method      first
+        Method      get
+        Method      orderBy
+        Method      where"#]]
+    .assert_eq(&members(&out));
+}
+
+#[tokio::test]
+async fn chained_call_multi_level_resolves_return_type() {
+    let mut s = TestServer::new().await;
+    s.validate_syntax(false);
+    let out = s
+        .check_completion_ordered(
+            r#"<?php
+class Builder {
+    public function where(string $col, mixed $val): static { return $this; }
+    public function orderBy(string $column): static { return $this; }
+    public function get(): array { return []; }
+}
+/** @mixin Builder */
+class Model {}
+class User extends Model {}
+User::where('id', 1)->orderBy('name')->$0
+"#,
+        )
+        .await;
+    expect![[r#"
+        Method      get
+        Method      orderBy
+        Method      where"#]]
+    .assert_eq(&members(&out));
+}
+
+#[tokio::test]
+async fn method_docblock_honoured_for_static_and_instance_calls() {
+    let mut s = TestServer::new().await;
+    s.validate_syntax(false);
+    let static_out = s
+        .check_completion_ordered(
+            r#"<?php
+/**
+ * @method static int compute(int $x)
+ * @method string format(string $pattern)
+ */
+class Service {}
+Service::$0
+"#,
+        )
+        .await;
+    expect![[r#"
+        Method      compute
+        Method      format"#]]
+    .assert_eq(&members(&static_out));
+
+    let instance_out = s
+        .check_completion_ordered(
+            r#"<?php
+/**
+ * @method static int compute(int $x)
+ * @method string format(string $pattern)
+ */
+class Service {}
+function test(Service $service) {
+    $service->$0
+}
+"#,
+        )
+        .await;
+    expect![[r#"
+        Method      compute
+        Method      format"#]]
+    .assert_eq(&members(&instance_out));
+}
+
+#[tokio::test]
+async fn probe_case_builder_chain_indexed_from_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app_dir = tmp.path().join("app/Models");
+    let auth_dir = tmp.path().join("vendor/laravel/framework/src/Illuminate/Foundation/Auth");
+    let elo_dir = tmp.path().join("vendor/laravel/framework/src/Illuminate/Database/Eloquent");
+    let qry_dir = tmp.path().join("vendor/laravel/framework/src/Illuminate/Database/Query");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::create_dir_all(&auth_dir).unwrap();
+    std::fs::create_dir_all(&elo_dir).unwrap();
+    std::fs::create_dir_all(&qry_dir).unwrap();
+
+    std::fs::write(
+        tmp.path().join("composer.json"),
+        r#"{"autoload":{"psr-4":{"App\\":"app/","Illuminate\\Foundation\\":"vendor/laravel/framework/src/Illuminate/Foundation/","Illuminate\\Database\\":"vendor/laravel/framework/src/Illuminate/Database/"}}}"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        qry_dir.join("Builder.php"),
+        r#"<?php
+namespace Illuminate\Database\Query;
+
+class Builder {
+    public function first($columns = ['*']) { return null; }
+    public function orderBy($column, $direction = 'asc') { return $this; }
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        elo_dir.join("Builder.php"),
+        r#"<?php
+namespace Illuminate\Database\Eloquent;
+
+/**
+ * @template TModel of \Illuminate\Database\Eloquent\Model
+ * @mixin \Illuminate\Database\Query\Builder
+ */
+class Builder {
+    /**
+     * @param mixed $column
+     * @param mixed $operator
+     * @param mixed $value
+     * @param string $boolean
+     * @return $this
+     */
+    public function where($column, $operator = null, $value = null, $boolean = 'and') { return $this; }
+    public function get($columns = ['*']) { return []; }
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        elo_dir.join("Model.php"),
+        r#"<?php
+namespace Illuminate\Database\Eloquent;
+
+abstract class Model {
+    /**
+     * @var class-string<\Illuminate\Database\Eloquent\Builder<*>>
+     */
+    protected static string $builder = Builder::class;
+
+    /**
+     * Begin querying the model.
+     *
+     * @return \Illuminate\Database\Eloquent\Builder<static>
+     */
+    public static function query()
+    {
+        return new Builder();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        auth_dir.join("User.php"),
+        r#"<?php
+namespace Illuminate\Foundation\Auth;
+
+use Illuminate\Database\Eloquent\Model;
+
+class User extends Model {}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        app_dir.join("User.php"),
+        r#"<?php
+namespace App\Models;
+
+use Illuminate\Foundation\Auth\User as Authenticatable;
+
+class User extends Authenticatable {}
+"#,
+    )
+    .unwrap();
+
+    let scratch_src = "<?php\n\\App\\Models\\User::where('id', 1)->";
+    let scratch_file = tmp.path().join("scratch.php");
+    std::fs::write(&scratch_file, scratch_src).unwrap();
+
+    let mut s = TestServer::with_root(tmp.path()).await;
+    s.validate_syntax(false);
+    s.wait_for_index_ready().await;
+    s.open("scratch.php", scratch_src).await;
+
+    let uri = s.uri("scratch.php");
+    let resp = s
+        .client()
+        .request(
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 34 },
+                "context": { "triggerKind": 1 },
+            }),
+        )
+        .await;
+
+    let rendered = render_completion_ordered(&resp);
+    expect![[r#"
+        Method      first
+        Method      get
+        Method      orderBy
+        Method      where"#]]
+    .assert_eq(&members(&rendered));
+}
+

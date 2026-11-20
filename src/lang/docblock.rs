@@ -72,7 +72,7 @@ fn body_after_type_and_var(s: &str) -> Option<String> {
     Some(rest.join(" ").trim().to_string())
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Clone)]
 pub struct Docblock {
     /// Free-text description (lines before the first `@` tag).
     pub description: String,
@@ -106,14 +106,14 @@ pub struct Docblock {
     pub methods: Vec<DocMethod>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct DocProperty {
     pub type_hint: String,
     pub name: String,    // without $
     pub read_only: bool, // true for @property-read
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct DocMethodParam {
     pub name: String,
     pub type_hint: String,
@@ -122,7 +122,7 @@ pub struct DocMethodParam {
     pub is_optional: bool,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct DocMethod {
     pub return_type: String,
     pub name: String,
@@ -130,7 +130,7 @@ pub struct DocMethod {
     pub params: Vec<DocMethodParam>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct DocTypeAlias {
     /// Alias name, e.g. `UserId`.
     pub name: String,
@@ -145,7 +145,7 @@ pub enum TemplateVariance {
     Contravariant,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct DocTemplate {
     /// Template parameter name, e.g. `T`.
     pub name: String,
@@ -155,20 +155,20 @@ pub struct DocTemplate {
     pub variance: TemplateVariance,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct DocParam {
     pub type_hint: String,
     pub name: String,
     pub description: String,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct DocReturn {
     pub type_hint: String,
     pub description: String,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct DocThrows {
     pub class: String,
     pub description: String,

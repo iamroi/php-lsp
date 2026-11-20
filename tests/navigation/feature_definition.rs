@@ -1936,3 +1936,29 @@ async fn implementation_after_emoji_uses_utf16_columns() {
     let resp = s.implementation("main.php", 1, 12).await;
     expect!["main.php:2:15-2:21"].assert_eq(&render_locations(&resp, &s.uri("")));
 }
+
+#[tokio::test]
+async fn definition_on_static_mixin_method() {
+    let mut s = TestServer::new().await;
+    let out = s
+        .check_definition(
+            r#"//- /src/Builder.php
+<?php
+class Builder {
+    public function where(string $column): static { return $this; }
+}
+
+//- /src/Model.php
+<?php
+/** @mixin Builder */
+class Model {}
+
+//- /src/main.php
+<?php
+class User extends Model {}
+User::whe$0re('id');
+"#,
+        )
+        .await;
+    expect!["src/Builder.php:2:20-2:25"].assert_eq(&out);
+}

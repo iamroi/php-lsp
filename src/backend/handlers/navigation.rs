@@ -4,6 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
 
 use crate::analysis::document_highlight::document_highlights;
+use crate::document::ast::ParsedDoc;
 use crate::document::document_store::{ContentModified, SETTLE_POLL, WriteSettle};
 use crate::lang::is_unresolvable_bareword_at;
 use crate::navigation::definition::find_declaration_range;
@@ -154,6 +155,139 @@ impl Backend {
             }
             let wi = self.workspace_index_cached(&mut wi_cache).await;
             if let Some(word) = crate::text::word_at_position(&source, position) {
+                let docs = Arc::clone(&self.docs);
+                let wi_task = Arc::clone(&wi);
+                let doc_task = Arc::clone(&doc);
+                let source_task = Arc::clone(&source);
+                let word_task = word.clone();
+
+                let member_location = self
+                    .blocking_gated(super::super::debug_gate::GATE_GOTO_DEFINITION, move || {
+                        let find_class_doc_fn = |class_name_query: &str| -> Option<Arc<ParsedDoc>> {
+                            let fqn = crate::navigation::moniker::resolve_fqn(
+                                &doc_task,
+                                class_name_query,
+                                &doc_task.file_imports(),
+                            );
+                            let class_ref = docs
+                                .resolve_class_ref_by_fqn(&wi_task, &fqn)
+                                .or_else(|| {
+                                    let short = crate::text::fqn_short_name(class_name_query);
+                                    let name_lc = short.to_lowercase();
+                                    let table = &wi_task.classes_by_lowercase_name;
+                                    let pos = table.partition_point(|(s, _)| s.as_ref() < name_lc.as_str());
+                                    table.get(pos).and_then(|(s, cr)| {
+                                        (s.as_ref() == name_lc.as_str()).then_some(*cr)
+                                    })
+                                })?;
+                            let (target_uri, _) = wi_task.at(class_ref)?;
+                            docs.get_doc_salsa(target_uri)
+                        };
+
+                        if let Some(static_class) = class_before_double_colon(&source_task, position) {
+                            let effective_class = if static_class == "self" || static_class == "static" {
+                                crate::types::type_map::enclosing_class_at(&source_task, &doc_task, position)
+                                    .unwrap_or(static_class)
+                            } else {
+                                let imports = doc_task.file_imports();
+                                if let Some(fqcn) = imports.get(&static_class) {
+                                    fqcn.trim_start_matches('\\').to_string()
+                                } else {
+                                    crate::types::type_map::resolve_class_ref(&doc_task, &static_class, &static_class)
+                                }
+                            };
+                            let empty_docs: Vec<Arc<ParsedDoc>> = Vec::new();
+                            if let Some(method_info) = crate::types::type_map::find_method_in_class_hierarchy(
+                                &doc_task,
+                                &empty_docs,
+                                Some(&find_class_doc_fn),
+                                Some(docs.as_ref()),
+                                &effective_class,
+                                &word_task,
+                            ) {
+                                if let Some(location) = method_info.location {
+                                    return Some(location);
+                                }
+                            }
+                            if let Some(property_info) = crate::types::type_map::find_property_in_class_hierarchy(
+                                &doc_task,
+                                &empty_docs,
+                                Some(&find_class_doc_fn),
+                                Some(docs.as_ref()),
+                                &effective_class,
+                                &word_task,
+                            ) {
+                                if let Some(location) = property_info.location {
+                                    return Some(location);
+                                }
+                            }
+                        }
+
+                        if let Some(line) = source_task.lines().nth(position.line as usize) {
+                            let col = position.character as usize;
+                            let line_chars: Vec<char> = line.chars().collect();
+                            let char_index = crate::text::utf16_col_to_char_index(&line_chars, col);
+                            let mut word_start = char_index;
+                            let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+                            while word_start > 0 && is_word_char(line_chars[word_start - 1]) {
+                                word_start -= 1;
+                            }
+                            if (word_start >= 2 && line_chars[word_start - 2..word_start] == ['-', '>'])
+                                || (word_start >= 3 && line_chars[word_start - 3..word_start] == ['?', '-', '>'])
+                            {
+                                let arrow_position = Position {
+                                    line: position.line,
+                                    character: crate::text::byte_to_utf16(line, word_start),
+                                };
+                                let empty_docs: Vec<Arc<ParsedDoc>> = Vec::new();
+                                if let Some(receiver_classes) = crate::completion::resolve_receiver_class(
+                                    &source_task,
+                                    &doc_task,
+                                    &empty_docs,
+                                    arrow_position,
+                                    Some(&find_class_doc_fn),
+                                    Some(docs.as_ref()),
+                                    None,
+                                ) {
+                                    for receiver_class in receiver_classes {
+                                        if let Some(method_info) = crate::types::type_map::find_method_in_class_hierarchy(
+                                            &doc_task,
+                                            &empty_docs,
+                                            Some(&find_class_doc_fn),
+                                            Some(docs.as_ref()),
+                                            &receiver_class,
+                                            &word_task,
+                                        ) {
+                                            if let Some(location) = method_info.location {
+                                                return Some(location);
+                                            }
+                                        }
+                                        if let Some(property_info) = crate::types::type_map::find_property_in_class_hierarchy(
+                                            &doc_task,
+                                            &empty_docs,
+                                            Some(&find_class_doc_fn),
+                                            Some(docs.as_ref()),
+                                            &receiver_class,
+                                            &word_task,
+                                        ) {
+                                            if let Some(location) = property_info.location {
+                                                return Some(location);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        None
+                    })
+                    .await
+                    .flatten();
+
+                if let Some(location) = member_location {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+                }
+
                 let docs = Arc::clone(&self.docs);
                 let wi_task = Arc::clone(&wi);
                 let uri_task = uri.clone();

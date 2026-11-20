@@ -438,9 +438,75 @@ fn hover_at_core(
             a.symbol_at(off)
         })
     {
-        let mir_hover = mir_member_hover(sym, &word, doc, other_docs, find_class_doc);
+        let mir_hover = mir_member_hover(sym, &word, doc, other_docs, session, find_class_doc);
         if mir_hover.is_some() {
             return mir_hover.map(|value| Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: hover_range,
+            });
+        }
+    }
+
+    if !word.starts_with('$')
+        && let Some(line_text) = source.lines().nth(position.line as usize)
+        && let Some(class_name) =
+            extract_static_class_before_cursor(line_text, position.character as usize)
+    {
+        let effective_class = if class_name == "self" || class_name == "static" {
+            crate::types::type_map::enclosing_class_at(source, doc, position).unwrap_or(class_name)
+        } else {
+            let imports = doc.file_imports();
+            if let Some(fqcn) = imports.get(&class_name) {
+                fqcn.trim_start_matches('\\').to_string()
+            } else {
+                crate::types::type_map::resolve_class_ref(doc, &class_name, &class_name)
+            }
+        };
+        let open_docs_vector: Vec<std::sync::Arc<ParsedDoc>> =
+            other_docs.iter().map(|(_, d)| std::sync::Arc::clone(d)).collect();
+        if let Some(method_info) = crate::types::type_map::find_method_in_class_hierarchy(
+            doc,
+            &open_docs_vector,
+            find_class_doc,
+            session,
+            &effective_class,
+            &word,
+        ) {
+            let params_joined = method_info.params.join(", ");
+            let return_type_part = method_info
+                .return_type
+                .as_ref()
+                .map(|ret| format!(": {ret}"))
+                .unwrap_or_default();
+            let prefix = if method_info.is_virtual && method_info.is_static {
+                "static "
+            } else {
+                ""
+            };
+            let signature = format!(
+                "{}{}::{}({}){}",
+                prefix,
+                method_info.declaring_class,
+                method_info.name,
+                params_joined,
+                return_type_part
+            );
+            let mut value = wrap_php(&signature);
+            if let Some(doc_comment) = &method_info.doc_comment {
+                let markdown = if doc_comment.starts_with("/**") {
+                    crate::lang::docblock::parse_docblock(doc_comment).to_markdown()
+                } else {
+                    doc_comment.clone()
+                };
+                if !markdown.is_empty() {
+                    value.push_str("\n\n---\n\n");
+                    value.push_str(&markdown);
+                }
+            }
+            return Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
                     value,
@@ -604,6 +670,7 @@ fn mir_member_hover(
     word: &str,
     doc: &ParsedDoc,
     other_docs: &[(tower_lsp_server::ls_types::Uri, std::sync::Arc<ParsedDoc>)],
+    session: Option<&DocumentStore>,
     find_class_doc: Option<ClassDocLookup<'_>>,
 ) -> Option<String> {
     match &sym.kind {
@@ -634,6 +701,49 @@ fn mir_member_hover(
                     }
                     return Some(value);
                 }
+            }
+            let open_docs_vector: Vec<std::sync::Arc<ParsedDoc>> =
+                other_docs.iter().map(|(_, d)| std::sync::Arc::clone(d)).collect();
+            if let Some(method_info) = crate::types::type_map::find_method_in_class_hierarchy(
+                doc,
+                &open_docs_vector,
+                find_class_doc,
+                session,
+                class,
+                word,
+            ) {
+                let params_joined = method_info.params.join(", ");
+                let return_type_part = method_info
+                    .return_type
+                    .as_ref()
+                    .map(|ret| format!(": {ret}"))
+                    .unwrap_or_default();
+                let prefix = if method_info.is_virtual && method_info.is_static {
+                    "static "
+                } else {
+                    ""
+                };
+                let signature = format!(
+                    "{}{}::{}({}){}",
+                    prefix,
+                    method_info.declaring_class,
+                    method_info.name,
+                    params_joined,
+                    return_type_part
+                );
+                let mut value = wrap_php(&signature);
+                if let Some(doc_comment) = &method_info.doc_comment {
+                    let markdown = if doc_comment.starts_with("/**") {
+                        crate::lang::docblock::parse_docblock(doc_comment).to_markdown()
+                    } else {
+                        doc_comment.clone()
+                    };
+                    if !markdown.is_empty() {
+                        value.push_str("\n\n---\n\n");
+                        value.push_str(&markdown);
+                    }
+                }
+                return Some(value);
             }
             None
         }
